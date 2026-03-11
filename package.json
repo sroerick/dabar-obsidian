@@ -1,0 +1,27 @@
+{
+  "name": "dabar-obsidian",
+  "version": "0.1.0",
+  "description": "Obsidian plugin for browsing the Berean Standard Bible.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs --production",
+    "check": "tsc --noEmit --skipLibCheck",
+    "ci": "npm run check && npm run build"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "bible",
+    "berean-standard-bible"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.17.30",
+    "esbuild": "^0.25.4",
+    "obsidian": "^1.8.10",
+    "tslib": "^2.8.1",
+    "typescript": "^5.8.3"
+  }
+}
