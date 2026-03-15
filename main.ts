@@ -10,12 +10,20 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	TextComponent,
 	TFile,
 	ViewStateResult,
 	WorkspaceLeaf,
 	requestUrl,
 } from "obsidian";
 import { EditorView } from "@codemirror/view";
+import {
+	collectBibleUrisFromText,
+	extractBibleUriFromText as extractBibleUriFromTextValue,
+	findBibleUriMatchInLine as findBibleUriMatchInLineValue,
+	parseBibleUri as parseBibleUriValue,
+	type BibleUriMatch,
+} from "./bible-link-utils";
 
 interface BiblePluginSettings {
 	apiBaseUrl: string;
@@ -26,16 +34,17 @@ interface BiblePluginSettings {
 
 const DEFAULT_SETTINGS: BiblePluginSettings = {
 	apiBaseUrl: "https://bible.helloao.org/api",
-	strongsApiBaseUrl: "https://bible.helloao.org/api",
+	strongsApiBaseUrl: "https://api.biblesupersearch.com/api",
 	translation: "BSB",
 	includeFootnotes: false,
 };
+const LEGACY_DEFAULT_STRONGS_API_BASE_URL = "https://bible.helloao.org/api";
 
 const BIBLE_READER_VIEW_TYPE = "bible-reader-view";
 const BIBLE_BACKLINKS_VIEW_TYPE = "bible-backlinks-view";
 const BIBLE_BROWSER_VIEW_TYPE = "bible-browser-view";
 const BIBLE_STRONGS_VIEW_TYPE = "bible-strongs-view";
-const ENABLE_STRONGS_SIDEBAR = false;
+const ENABLE_STRONGS_SIDEBAR = true;
 const BIBLE_GRAPH_START = "<!-- BSB_GRAPH_LINKS_START -->";
 const BIBLE_GRAPH_END = "<!-- BSB_GRAPH_LINKS_END -->";
 
@@ -128,12 +137,6 @@ interface ParsedReference {
 	chapter: number;
 	verseStart?: number;
 	verseEnd?: number;
-}
-
-interface BibleUriMatch {
-	uri: string;
-	start: number;
-	end: number;
 }
 
 interface BibleCitationMatch {
@@ -617,6 +620,10 @@ export default class BereanStandardBibleBrowser extends Plugin {
 	private loadedTranslation = "";
 	private activeReaderReference: ParsedReference | null = null;
 	private strongsCache = new Map<string, StrongsEntry>();
+	private backlinkFilesByChapter = new Map<string, Set<string>>();
+	private backlinkChaptersByFile = new Map<string, Set<string>>();
+	private backlinkIndexReady = false;
+	private backlinkIndexBuildPromise: Promise<void> | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -674,16 +681,26 @@ export default class BereanStandardBibleBrowser extends Plugin {
 				name: "Lookup Strong's code",
 				callback: async () => {
 					await this.runWithErrorNotice(async () => {
-						const raw = await this.promptForStrongsCode();
-						if (!raw) {
-							return;
-						}
-						const code = this.normalizeStrongsCode(raw);
+						const code = await this.resolveStrongsCodeFromEditorOrPrompt();
 						if (!code) {
-							new Notice("Use format like G3056 or H7225.");
 							return;
 						}
 						await this.openStrongsSidebar(code);
+					});
+				},
+			});
+
+			this.addCommand({
+				id: "insert-strongs-quote",
+				name: "Insert Strong's quote",
+				callback: async () => {
+					await this.runWithErrorNotice(async () => {
+						const editor = this.getActiveEditor();
+						if (!editor) {
+							new Notice("No active markdown editor found.");
+							return;
+						}
+						await this.insertStrongsQuote(editor);
 					});
 				},
 			});
@@ -706,7 +723,7 @@ export default class BereanStandardBibleBrowser extends Plugin {
 
 		this.addCommand({
 			id: "insert-bible-passage",
-			name: "Insert Bible passage quote",
+			name: "Insert Bible passage or chapter quote",
 			callback: async () => {
 				await this.runWithErrorNotice(async () => {
 					const editor = this.getActiveEditor();
@@ -751,7 +768,7 @@ export default class BereanStandardBibleBrowser extends Plugin {
 
 		this.addCommand({
 			id: "convert-legacy-markdown-bible-links-active-file",
-			name: "Convert Markdown Bible links to wiki in active note",
+			name: "Convert Bible links to wiki in active note",
 			callback: async () => {
 				await this.runWithErrorNotice(async () => {
 					await this.convertLegacyLinksInActiveFile();
@@ -761,7 +778,7 @@ export default class BereanStandardBibleBrowser extends Plugin {
 
 		this.addCommand({
 			id: "convert-legacy-markdown-bible-links-vault",
-			name: "Convert Markdown Bible links to wiki in entire vault",
+			name: "Convert Bible links to wiki in entire vault",
 			callback: async () => {
 				await this.runWithErrorNotice(async () => {
 					await this.convertLegacyLinksInVault();
@@ -789,6 +806,10 @@ export default class BereanStandardBibleBrowser extends Plugin {
 			},
 		});
 
+		// Bible link handling is split across window-level event interception and rendered-markdown
+		// post-processing. Changes here need to stay consistent with the parser, renderer, and
+		// CodeMirror hit-testing below or link behavior will diverge across source, live preview,
+		// and reading modes.
 		this.registerEvent(
 			this.app.workspace.on("window-open", (_win, openedWindow) => {
 				this.registerBibleLinkHandlersForWindow(openedWindow);
@@ -798,6 +819,38 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		this.registerMarkdownPostProcessor((el) => {
 			this.decorateBibleProtocolLinks(el);
 		});
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile && file.extension === "md") {
+					void this.reindexBacklinkFile(file);
+				}
+			})
+		);
+		this.registerEvent(
+			this.app.vault.on("create", (file) => {
+				if (file instanceof TFile && file.extension === "md") {
+					void this.reindexBacklinkFile(file);
+				}
+			})
+		);
+		this.registerEvent(
+			this.app.vault.on("delete", (file) => {
+				if (file instanceof TFile) {
+					this.removeBacklinkFileIndex(file.path);
+				}
+			})
+		);
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (!(file instanceof TFile)) {
+					return;
+				}
+				this.removeBacklinkFileIndex(oldPath);
+				if (file.extension === "md") {
+					void this.reindexBacklinkFile(file);
+				}
+			})
+		);
 
 		this.addSettingTab(new BibleSettingTab(this.app, this));
 	}
@@ -809,6 +862,16 @@ export default class BereanStandardBibleBrowser extends Plugin {
 	async loadSettings(): Promise<void> {
 		const data = await this.loadData();
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+		if (
+			!data ||
+			typeof data !== "object" ||
+			!("strongsApiBaseUrl" in data) ||
+			typeof (data as { strongsApiBaseUrl?: unknown }).strongsApiBaseUrl !== "string" ||
+			(data as { strongsApiBaseUrl: string }).strongsApiBaseUrl.trim() === LEGACY_DEFAULT_STRONGS_API_BASE_URL
+		) {
+			this.settings.strongsApiBaseUrl = DEFAULT_SETTINGS.strongsApiBaseUrl;
+			await this.saveSettings();
+		}
 	}
 
 	async saveSettings(): Promise<void> {
@@ -854,6 +917,105 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		await this.refreshBooks(true);
 	}
 
+	private async ensureBacklinkIndex(): Promise<void> {
+		if (this.backlinkIndexReady) {
+			return;
+		}
+		if (this.backlinkIndexBuildPromise) {
+			await this.backlinkIndexBuildPromise;
+			return;
+		}
+
+		this.backlinkIndexBuildPromise = this.buildBacklinkIndex();
+		try {
+			await this.backlinkIndexBuildPromise;
+		} finally {
+			this.backlinkIndexBuildPromise = null;
+		}
+	}
+
+	private async buildBacklinkIndex(): Promise<void> {
+		this.backlinkFilesByChapter.clear();
+		this.backlinkChaptersByFile.clear();
+
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			await this.reindexBacklinkFile(file, true);
+		}
+
+		this.backlinkIndexReady = true;
+	}
+
+	private async reindexBacklinkFile(file: TFile, duringBuild = false): Promise<void> {
+		if (file.extension !== "md") {
+			return;
+		}
+		if (!duringBuild && !this.backlinkIndexReady && !this.backlinkIndexBuildPromise) {
+			return;
+		}
+
+		const body = await this.app.vault.cachedRead(file);
+		const chapterUris = await this.extractBacklinkChapterUris(body);
+		this.replaceBacklinkFileIndex(file.path, chapterUris);
+	}
+
+	private replaceBacklinkFileIndex(filePath: string, chapterUris: Set<string>): void {
+		this.removeBacklinkFileIndex(filePath);
+
+		if (chapterUris.size === 0) {
+			return;
+		}
+
+		this.backlinkChaptersByFile.set(filePath, new Set(chapterUris));
+		for (const chapterUri of chapterUris) {
+			const files = this.backlinkFilesByChapter.get(chapterUri) ?? new Set<string>();
+			files.add(filePath);
+			this.backlinkFilesByChapter.set(chapterUri, files);
+		}
+	}
+
+	private removeBacklinkFileIndex(filePath: string): void {
+		const previous = this.backlinkChaptersByFile.get(filePath);
+		if (!previous) {
+			return;
+		}
+
+		for (const chapterUri of previous) {
+			const files = this.backlinkFilesByChapter.get(chapterUri);
+			if (!files) {
+				continue;
+			}
+			files.delete(filePath);
+			if (files.size === 0) {
+				this.backlinkFilesByChapter.delete(chapterUri);
+			}
+		}
+
+		this.backlinkChaptersByFile.delete(filePath);
+	}
+
+	private async extractBacklinkChapterUris(input: string): Promise<Set<string>> {
+		const chapterUris = new Set<string>();
+		for (const uri of collectBibleUrisFromText(input)) {
+			const rawReference = this.parseBibleUri(uri);
+			if (!rawReference) {
+				continue;
+			}
+			const parsed = await this.parseReferenceSilently(rawReference);
+			if (!parsed) {
+				continue;
+			}
+			chapterUris.add(
+				this.buildBibleUri({
+					...parsed,
+					verseStart: undefined,
+					verseEnd: undefined,
+				})
+			);
+		}
+
+		return chapterUris;
+	}
+
 	private addAlias(alias: string, canonicalName: string): void {
 		const book = this.bookLookup.get(this.normalizeBookName(canonicalName));
 		if (book) {
@@ -861,6 +1023,9 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		}
 	}
 
+	// This is the shared entry point for every intercepted bible: link. If link rendering,
+	// parsing, or click interception changes, this path still needs to accept the same URI
+	// shapes or one mode will silently drift from the others.
 	private async openReferenceFromUri(uri: string): Promise<void> {
 		const rawReference = this.parseBibleUri(uri);
 		if (!rawReference) {
@@ -875,15 +1040,7 @@ export default class BereanStandardBibleBrowser extends Plugin {
 	}
 
 	private parseBibleUri(uri: string): string | null {
-		if (!uri.toLowerCase().startsWith("bible:")) {
-			return null;
-		}
-		const encodedReference = uri.replace(/^bible:(\/\/)?/i, "");
-		try {
-			return decodeURIComponent(encodedReference).trim();
-		} catch {
-			return encodedReference.trim();
-		}
+		return parseBibleUriValue(uri);
 	}
 
 	private async openReferenceFromPrompt(): Promise<void> {
@@ -921,7 +1078,7 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		const selected = editor.getSelection().trim();
 		const raw = await this.promptForReference(
 			"Insert Bible Passage",
-			"Revelation 1:5-11",
+			"Matthew 26 or Revelation 1:5-11",
 			selected,
 			"passage"
 		);
@@ -932,16 +1089,18 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		if (!parsed) {
 			return;
 		}
-		if (!parsed.verseStart) {
-			new Notice("Use a verse reference (example: Revelation 1:5-11).");
-			return;
-		}
 
 		const chapterData = await this.getChapter(parsed.bookId, parsed.chapter);
-		const verseEnd = parsed.verseEnd ?? parsed.verseStart;
-		const selectedVerses = this.collectVerseRange(chapterData, parsed.verseStart, verseEnd);
+		const selectedVerses =
+			parsed.verseStart === undefined
+				? this.collectChapterVerses(chapterData)
+				: this.collectVerseRange(chapterData, parsed.verseStart, parsed.verseEnd ?? parsed.verseStart);
 		if (selectedVerses.length === 0) {
-			new Notice("That verse range was not found in this chapter.");
+			new Notice(
+				parsed.verseStart === undefined
+					? "That chapter did not contain any verses."
+					: "That verse range was not found in this chapter."
+			);
 			return;
 		}
 
@@ -1115,6 +1274,21 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		return output;
 	}
 
+	private collectChapterVerses(chapterData: ApiChapterResponse): Array<{ verse: number; text: string }> {
+		const output: Array<{ verse: number; text: string }> = [];
+		for (const item of chapterData.content) {
+			if (item.type !== "verse") {
+				continue;
+			}
+			const verseText = this.renderVerseContent(item.content).replace(/\s+/g, " ").trim();
+			if (!verseText) {
+				continue;
+			}
+			output.push({ verse: item.verse, text: verseText });
+		}
+		return output;
+	}
+
 	private renderPassageBlock(
 		parsed: ParsedReference,
 		verses: Array<{ verse: number; text: string }>
@@ -1132,6 +1306,38 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		return lines.join("\n");
 	}
 
+	private renderStrongsEntryBlock(entry: StrongsEntry): string {
+		const titleParts = [entry.code];
+		if (entry.lemma) {
+			titleParts.push(entry.lemma);
+		}
+		const lines = [`> [!strongs] ${titleParts.join(" - ")}`];
+		lines.push(`> Code: ${entry.code}`);
+		if (entry.transliteration) {
+			lines.push(`> Transliteration: ${entry.transliteration}`);
+		}
+		if (entry.pronunciation) {
+			lines.push(`> Pronunciation: ${entry.pronunciation}`);
+		}
+		if (entry.definition) {
+			lines.push(`> Definition: ${entry.definition}`);
+		}
+		if (entry.kjvDefinition) {
+			lines.push(`> KJV Definition: ${entry.kjvDefinition}`);
+		}
+		if (entry.derivation) {
+			lines.push(`> Derivation: ${entry.derivation}`);
+		}
+		if (typeof entry.occurrences === "number") {
+			lines.push(`> Occurrences: ${entry.occurrences}`);
+		}
+		if (entry.references && entry.references.length > 0) {
+			lines.push(`> References: ${entry.references.slice(0, 20).join(", ")}`);
+		}
+		lines.push("");
+		return lines.join("\n");
+	}
+
 	private chapterReferenceLink(bookName: string, chapter: number): string {
 		const label = `${bookName} ${chapter}`;
 		return `[[${this.buildBibleUri({ original: label, bookId: "", bookName, chapter })}|${label}]]`;
@@ -1139,6 +1345,55 @@ export default class BereanStandardBibleBrowser extends Plugin {
 
 	private async openChapterForReference(reference: ParsedReference): Promise<void> {
 		await this.openChapterReader(reference);
+	}
+
+	private async getAdjacentChapterReference(reference: ParsedReference, delta: -1 | 1): Promise<ParsedReference | null> {
+		await this.refreshBooks();
+		if (this.orderedBooks.length === 0) {
+			return null;
+		}
+
+		const currentBookId = reference.bookId.toUpperCase();
+		const currentBookIndex = this.orderedBooks.findIndex((book) => book.id.toUpperCase() === currentBookId);
+		if (currentBookIndex < 0) {
+			return null;
+		}
+
+		const currentBook = this.orderedBooks[currentBookIndex];
+		const currentChapter = Math.max(1, reference.chapter);
+		const currentBookChapterCount = Math.max(1, currentBook.chapterCount ?? 1);
+
+		if (delta > 0) {
+			if (currentChapter < currentBookChapterCount) {
+				return this.buildParsedChapterReference(currentBook, currentChapter + 1);
+			}
+			const nextBook = this.orderedBooks[currentBookIndex + 1];
+			if (!nextBook) {
+				return null;
+			}
+			return this.buildParsedChapterReference(nextBook, 1);
+		}
+
+		if (currentChapter > 1) {
+			return this.buildParsedChapterReference(currentBook, currentChapter - 1);
+		}
+		const previousBook = this.orderedBooks[currentBookIndex - 1];
+		if (!previousBook) {
+			return null;
+		}
+		const previousBookChapterCount = Math.max(1, previousBook.chapterCount ?? 1);
+		return this.buildParsedChapterReference(previousBook, previousBookChapterCount);
+	}
+
+	private buildParsedChapterReference(book: ApiBook, chapter: number): ParsedReference {
+		const safeChapter = Math.max(1, chapter);
+		const bookName = book.commonName || book.name;
+		return {
+			original: `${bookName} ${safeChapter}`,
+			bookId: book.id.toUpperCase(),
+			bookName,
+			chapter: safeChapter,
+		};
 	}
 
 	private async openChapterReader(reference: ParsedReference): Promise<void> {
@@ -1233,13 +1488,16 @@ export default class BereanStandardBibleBrowser extends Plugin {
 	}
 
 	async openChapterFromBrowser(book: ApiBook, chapter: number): Promise<void> {
-		const parsed: ParsedReference = {
-			original: `${book.commonName || book.name} ${chapter}`,
-			bookId: book.id.toUpperCase(),
-			bookName: book.commonName || book.name,
-			chapter,
-		};
+		const parsed = this.buildParsedChapterReference(book, chapter);
 		await this.openChapterForReference(parsed);
+	}
+
+	async openChapterForReferencePublic(reference: ParsedReference): Promise<void> {
+		await this.openChapterForReference(reference);
+	}
+
+	async getAdjacentChapterReferencePublic(reference: ParsedReference, delta: -1 | 1): Promise<ParsedReference | null> {
+		return await this.getAdjacentChapterReference(reference, delta);
 	}
 
 	private async refreshBacklinksViews(): Promise<void> {
@@ -1287,6 +1545,82 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		return await modal.waitForResult();
 	}
 
+	private async resolveStrongsCodeFromEditorOrPrompt(editor?: Editor | null): Promise<string | null> {
+		const candidate = editor ? this.extractStrongsCodeFromEditor(editor) : null;
+		if (candidate) {
+			return candidate;
+		}
+
+		const raw = await this.promptForStrongsCode();
+		if (!raw) {
+			return null;
+		}
+
+		const code = this.normalizeStrongsCode(raw);
+		if (!code) {
+			new Notice("Use format like G3056 or H7225.");
+			return null;
+		}
+		return code;
+	}
+
+	private extractStrongsCodeFromEditor(editor: Editor): string | null {
+		const selection = editor.getSelection().trim();
+		if (selection.length > 0) {
+			return this.extractStrongsCodeFromText(selection);
+		}
+
+		const cursor = editor.getCursor();
+		const line = editor.getLine(cursor.line);
+		const match = this.findStrongsCodeMatchInLine(line, cursor.ch);
+		return match?.code ?? null;
+	}
+
+	private extractStrongsCodeFromText(input: string): string | null {
+		const trimmed = input.trim();
+		if (!trimmed) {
+			return null;
+		}
+
+		const direct = this.normalizeStrongsCode(trimmed);
+		if (direct) {
+			return direct;
+		}
+
+		const match = trimmed.match(/\b([GH]\d{1,5})\b/i);
+		return match ? this.normalizeStrongsCode(match[1]) : null;
+	}
+
+	private findStrongsCodeMatchInLine(line: string, offset?: number): { code: string; start: number; end: number } | null {
+		const pattern = /\b([GH]\d{1,5})\b/gi;
+		let match: RegExpExecArray | null = null;
+		while ((match = pattern.exec(line)) !== null) {
+			const start = match.index;
+			const end = start + match[0].length;
+			const code = this.normalizeStrongsCode(match[1]);
+			if (!code) {
+				continue;
+			}
+			if (offset === undefined || (offset >= start && offset < end)) {
+				return { code, start, end };
+			}
+		}
+		return null;
+	}
+
+	private async insertStrongsQuote(editor: Editor): Promise<void> {
+		const from = editor.getCursor("from");
+		const to = editor.getCursor("to");
+		const code = await this.resolveStrongsCodeFromEditorOrPrompt(editor);
+		if (!code) {
+			return;
+		}
+
+		const entry = await this.lookupStrongsEntry(code);
+		const block = this.renderStrongsEntryBlock(entry);
+		editor.replaceRange(block, from, to);
+	}
+
 	async lookupStrongsEntry(code: string): Promise<StrongsEntry> {
 		const normalized = this.normalizeStrongsCode(code);
 		if (!normalized) {
@@ -1299,6 +1633,7 @@ export default class BereanStandardBibleBrowser extends Plugin {
 
 		const base = this.settings.strongsApiBaseUrl.trim().replace(/\/+$/, "");
 		const candidates = [
+			`${base}/strongs?strongs=${encodeURIComponent(normalized)}`,
 			`${base}/strongs/${normalized}.json`,
 			`${base}/strong/${normalized}.json`,
 			`${base}/lexicon/${normalized}.json`,
@@ -1311,21 +1646,44 @@ export default class BereanStandardBibleBrowser extends Plugin {
 				if (response.status < 200 || response.status >= 300) {
 					continue;
 				}
+				if (this.looksLikeHtmlResponse(response)) {
+					throw new Error(
+						"The configured Strong's API base URL does not expose Strong's JSON data. Set Strongs API base URL to a compatible API."
+					);
+				}
 				const entry = this.parseStrongsPayload(response.json, normalized);
 				if (!entry) {
 					continue;
 				}
 				this.strongsCache.set(normalized, entry);
 				return entry;
-			} catch {
+			} catch (error) {
+				if (error instanceof Error && error.message.includes("does not expose Strong's JSON data")) {
+					throw error;
+				}
 				// Try next candidate.
 			}
 		}
 
-		throw new Error("Strong's entry not found. Check Strongs API base URL in settings.");
+		throw new Error(
+			"Strong's entry not found. If you are using the default API, configure Strongs API base URL to a compatible Strong's endpoint in settings."
+		);
+	}
+
+	private looksLikeHtmlResponse(response: { headers: Record<string, string>; text: string }): boolean {
+		const contentType = response.headers["content-type"]?.toLowerCase() ?? "";
+		if (contentType.includes("text/html")) {
+			return true;
+		}
+		return /^\s*<!doctype html/i.test(response.text) || /^\s*<html/i.test(response.text);
 	}
 
 	private parseStrongsPayload(payload: unknown, fallbackCode: string): StrongsEntry | null {
+		const wrapped = this.unwrapStrongsPayload(payload, fallbackCode);
+		if (wrapped) {
+			return wrapped;
+		}
+
 		if (!payload || typeof payload !== "object") {
 			return null;
 		}
@@ -1343,7 +1701,9 @@ export default class BereanStandardBibleBrowser extends Plugin {
 			return null;
 		}
 
-		const lemma = this.firstNonEmptyString([raw.lemma, raw.word, raw.original, raw.lexeme, raw.hebrew, raw.greek]);
+		const lemma = this.cleanStrongsText(
+			this.firstNonEmptyString([raw.lemma, raw.word, raw.original, raw.lexeme, raw.hebrew, raw.greek])
+		);
 		const transliteration = this.firstNonEmptyString([
 			raw.transliteration,
 			raw.translit,
@@ -1351,15 +1711,11 @@ export default class BereanStandardBibleBrowser extends Plugin {
 			raw.pronunciation,
 		]);
 		const pronunciation = this.firstNonEmptyString([raw.pronunciation, raw.pronounce, raw.phonetic]);
-		const definition = this.firstNonEmptyString([
-			raw.definition,
-			raw.meaning,
-			raw.gloss,
-			raw.strongsDef,
-			raw.strongs_def,
-		]);
-		const derivation = this.firstNonEmptyString([raw.derivation, raw.origin]);
-		const kjvDefinition = this.firstNonEmptyString([raw.kjvDefinition, raw.kjv_def, raw.kjv]);
+		const definition = this.cleanStrongsText(
+			this.firstNonEmptyString([raw.definition, raw.meaning, raw.gloss, raw.strongsDef, raw.strongs_def])
+		);
+		const derivation = this.cleanStrongsText(this.firstNonEmptyString([raw.derivation, raw.origin]));
+		const kjvDefinition = this.cleanStrongsText(this.firstNonEmptyString([raw.kjvDefinition, raw.kjv_def, raw.kjv]));
 		const references = this.toStringArray(raw.references ?? raw.verses ?? raw.citations);
 		const occurrences =
 			typeof raw.occurrences === "number"
@@ -1387,6 +1743,64 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		};
 	}
 
+	private unwrapStrongsPayload(payload: unknown, fallbackCode: string): StrongsEntry | null {
+		if (!payload || typeof payload !== "object") {
+			return null;
+		}
+
+		const wrappedResults = (payload as { results?: unknown }).results;
+		if (!Array.isArray(wrappedResults)) {
+			return null;
+		}
+
+		let tvmDefinition: string | undefined;
+		for (const result of wrappedResults) {
+			if (!result || typeof result !== "object") {
+				continue;
+			}
+			const raw = result as Record<string, unknown>;
+			const code = this.normalizeStrongsCode(
+				this.firstNonEmptyString([raw.number, raw.code, raw.id, raw.strongs, raw.strong]) ?? fallbackCode
+			);
+			if (!code || code !== fallbackCode) {
+				continue;
+			}
+
+			const definition = this.cleanStrongsText(this.firstNonEmptyString([raw.entry]));
+			const tvm = this.cleanStrongsText(this.firstNonEmptyString([raw.tvm]));
+			if (tvm && !definition) {
+				tvmDefinition = tvm;
+			}
+
+			const entry = this.parseStrongsPayload(
+				{
+					code,
+					lemma: raw.root_word,
+					transliteration: raw.transliteration,
+					pronunciation: raw.pronunciation,
+					definition: definition ?? tvm,
+					kjvDefinition: raw.kjv,
+					derivation: raw.derivation,
+					occurrences: raw.occurrences,
+					references: raw.references,
+				},
+				fallbackCode
+			);
+			if (entry) {
+				return entry;
+			}
+		}
+
+		if (!tvmDefinition) {
+			return null;
+		}
+
+		return {
+			code: fallbackCode,
+			definition: tvmDefinition,
+		};
+	}
+
 	private firstNonEmptyString(values: unknown[]): string | undefined {
 		for (const value of values) {
 			if (typeof value === "string" && value.trim().length > 0) {
@@ -1403,6 +1817,44 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		return value
 			.map((entry) => (typeof entry === "string" ? entry.trim() : ""))
 			.filter((entry) => entry.length > 0);
+	}
+
+	private cleanStrongsText(value?: string): string | undefined {
+		if (!value) {
+			return undefined;
+		}
+
+		const normalized = value
+			.replace(/<br\s*\/?>/gi, "\n")
+			.replace(/<\/p>\s*<p>/gi, "\n\n")
+			.replace(/<[^>]+>/g, "")
+			.replace(/&#x([0-9a-f]+);/gi, (_match, hex) => this.decodeNumericEntity(hex, 16))
+			.replace(/&#(\d+);/g, (_match, decimal) => this.decodeNumericEntity(decimal, 10))
+			.replace(/&nbsp;/gi, " ")
+			.replace(/&quot;/gi, '"')
+			.replace(/&#39;/gi, "'")
+			.replace(/&apos;/gi, "'")
+			.replace(/&amp;/gi, "&")
+			.replace(/&lt;/gi, "<")
+			.replace(/&gt;/gi, ">")
+			.replace(/\r/g, "")
+			.replace(/[ \t]+\n/g, "\n")
+			.replace(/\n{3,}/g, "\n\n")
+			.trim();
+
+		return normalized.length > 0 ? normalized : undefined;
+	}
+
+	private decodeNumericEntity(value: string, radix: 10 | 16): string {
+		const codePoint = Number.parseInt(value, radix);
+		if (!Number.isFinite(codePoint) || codePoint <= 0) {
+			return "";
+		}
+		try {
+			return String.fromCodePoint(codePoint);
+		} catch {
+			return "";
+		}
 	}
 
 	private normalizeStrongsCode(input: string): string | null {
@@ -1433,32 +1885,24 @@ export default class BereanStandardBibleBrowser extends Plugin {
 	}
 
 	private async findChapterBacklinks(reference: ParsedReference): Promise<TFile[]> {
-		const files = this.app.vault.getMarkdownFiles();
-		const chapterLabel = `${reference.bookName} ${reference.chapter}`;
-		const encodedLabel = encodeURIComponent(chapterLabel);
+		await this.ensureBacklinkIndex();
 		const chapterUri = this.buildBibleUri({
 			...reference,
 			verseStart: undefined,
 			verseEnd: undefined,
 		});
+		const matchedPaths = this.backlinkFilesByChapter.get(chapterUri);
+		if (!matchedPaths || matchedPaths.size === 0) {
+			return [];
+		}
 
-		const patterns = [
-			new RegExp(`bible:\\/\\/${this.escapeRegex(chapterLabel)}(?:\\b|%20|%3A|\\)|\\])`, "i"),
-			new RegExp(`bible:\\/\\/${this.escapeRegex(encodedLabel)}(?:\\b|\\)|\\])`, "i"),
-			new RegExp(`${this.escapeRegex(chapterUri)}(?:\\b|:\\d+(?:-\\d+)?)`, "i"),
-		];
-
-		const matches = await Promise.all(
-			files.map(async (file) => {
-				const body = await this.app.vault.cachedRead(file);
-				if (patterns.some((pattern) => pattern.test(body))) {
-					return file;
-				}
-				return null;
-			})
-		);
-
-		return matches.filter((file): file is TFile => file !== null);
+		const matches: TFile[] = [];
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			if (matchedPaths.has(file.path)) {
+				matches.push(file);
+			}
+		}
+		return matches;
 	}
 
 	private async parseReference(rawReference: string): Promise<ParsedReference | null> {
@@ -1679,13 +2123,13 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		const original = await this.app.vault.cachedRead(file);
 		const result = await this.convertMarkdownBibleLinksInText(original);
 		if (result.replaced === 0) {
-			new Notice("No Markdown Bible links found.");
+			new Notice("No convertible Bible links found.");
 			return;
 		}
 
 		await this.app.vault.modify(file, result.output);
 		new Notice(
-			`Converted ${result.replaced} Markdown Bible link(s) in ${file.basename}${
+			`Converted ${result.replaced} Bible link(s) in ${file.basename}${
 				result.skipped > 0 ? ` (${result.skipped} skipped)` : ""
 			}.`
 		);
@@ -1709,11 +2153,11 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		}
 
 		if (replaced === 0) {
-			new Notice("No Markdown Bible links found in vault.");
+			new Notice("No convertible Bible links found in vault.");
 			return;
 		}
 		new Notice(
-			`Converted ${replaced} Markdown Bible link(s) across ${changedFiles} file(s)${
+			`Converted ${replaced} Bible link(s) across ${changedFiles} file(s)${
 				skipped > 0 ? ` (${skipped} skipped)` : ""
 			}.`
 		);
@@ -1806,6 +2250,46 @@ export default class BereanStandardBibleBrowser extends Plugin {
 			}
 			output += canonical;
 			cursor = match.index + fullMatch.length;
+		}
+
+		output += working.slice(cursor);
+		working = output;
+
+		const bareBiblePattern = /\b(bible:(?:\/\/)?[^\s)\]]+)/gi;
+		output = "";
+		cursor = 0;
+		match = null;
+		while ((match = bareBiblePattern.exec(working)) !== null) {
+			const [fullMatch, matchedUri] = match;
+			const start = match.index;
+			const end = start + fullMatch.length;
+			output += working.slice(cursor, start);
+
+			if (this.isRangeInsideLinkSyntax(working, start, end)) {
+				output += fullMatch;
+				cursor = end;
+				continue;
+			}
+
+			const uri = matchedUri.replace(/[.,;!?]+$/, "");
+			const trailing = matchedUri.slice(uri.length);
+			const rawReference = this.parseBibleUri(uri);
+			if (!rawReference) {
+				output += fullMatch;
+				cursor = end;
+				continue;
+			}
+
+			const parsed = await this.parseReferenceSilently(rawReference);
+			if (!parsed) {
+				output += fullMatch;
+				cursor = end;
+				continue;
+			}
+
+			output += `${this.renderBibleWikiLink(parsed)}${trailing}`;
+			replaced += 1;
+			cursor = end;
 		}
 
 		output += working.slice(cursor);
@@ -2140,6 +2624,9 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		);
 	}
 
+	// This handler coordinates all click interception for Bible links. It is easy to create
+	// inconsistent behavior here because rendered markdown, live preview, and source view expose
+	// different DOM shapes. Small "safe" tweaks have previously caused regressions in hit-testing.
 	private handleBibleLinkMouseEvent(event: MouseEvent): void {
 		const rawTarget = event.target;
 		const target =
@@ -2176,9 +2663,11 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		void this.runWithErrorNotice(() => this.openReferenceFromUri(href));
 	}
 
+	// Link resolution is intentionally layered: prefer explicit DOM href/data-href attributes,
+	// then fall back to CodeMirror text hit-testing only when the click looks like real link UI.
+	// Broadening this logic tends to make whitespace or nearby text clickable.
 	private extractBibleHref(event: MouseEvent, target: HTMLElement): string | null {
 		const path = typeof event.composedPath === "function" ? event.composedPath() : [target];
-		let hasLinkContext = false;
 		for (const node of path) {
 			if (!(node instanceof HTMLElement)) {
 				continue;
@@ -2191,15 +2680,9 @@ export default class BereanStandardBibleBrowser extends Plugin {
 			if (dataHref && dataHref.toLowerCase().startsWith("bible:")) {
 				return dataHref;
 			}
-			if (
-				node.matches(
-					"a, .external-link, .cm-link, .cm-url, .cm-hmd-external-link, .cm-formatting-link, .cm-hmd-barelink, .cm-string.cm-url"
-				)
-			) {
-				hasLinkContext = true;
-			}
 		}
-		if (!hasLinkContext) {
+
+		if (!this.hasEditorLinkContext(path)) {
 			return null;
 		}
 
@@ -2210,6 +2693,28 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		return null;
 	}
 
+	// This guard is brittle but necessary. Live preview can place clicks on wrapper spans rather
+	// than anchors, but removing this guard makes entire lines clickable. If you change the class
+	// list, verify source mode and live preview separately.
+	private hasEditorLinkContext(path: EventTarget[]): boolean {
+		for (const node of path) {
+			if (!(node instanceof HTMLElement)) {
+				continue;
+			}
+			if (
+				node.matches(
+					"a, .external-link, .internal-link, .cm-link, .cm-url, .cm-hmd-external-link, .cm-hmd-internal-link, .cm-hmd-barelink, .cm-formatting-link, .cm-formatting-link-start, .cm-formatting-link-end, .cm-string.cm-url"
+				)
+			) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Coordinate-based lookup in CodeMirror is one of the most fragile parts of link handling.
+	// It must agree with DOM-based interception and with the regex span matcher below or clicks
+	// will fire outside the visible link or stop working in one editor mode.
 	private extractBibleHrefFromEditorView(event: MouseEvent, target: HTMLElement): string | null {
 		const cmHost = target.closest(".cm-editor") as HTMLElement | null;
 		if (!cmHost) {
@@ -2232,41 +2737,16 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		return this.findBibleUriMatchInLine(line, offset)?.uri ?? null;
 	}
 
+	// These patterns define which textual forms count as Bible links during editor hit-testing.
+	// They are tightly coupled to link generation and conversion code elsewhere. Adding or
+	// changing a pattern without updating the renderer/converter is likely to create mode-specific
+	// bugs that are hard to diagnose.
 	private findBibleUriMatchInLine(line: string, offset?: number): BibleUriMatch | null {
-		const patterns = [
-			/\[\[[^\]|]+\|\s*(bible:(?:\/\/)?[^\]]+)\]\]/gi,
-			/\[[^\]]*]\((bible:(?:\/\/)?[^)]+)\)/gi,
-			/\b(bible:(?:\/\/)?[^\s)\]]+)/gi,
-		];
-
-		for (const pattern of patterns) {
-			pattern.lastIndex = 0;
-			let match: RegExpExecArray | null = null;
-			while ((match = pattern.exec(line)) !== null) {
-				const fullStart = match.index;
-				const fullEnd = fullStart + match[0].length;
-				const uri = match[1]?.trim().replace(/[.,;!?]+$/, "");
-				if (!uri) {
-					continue;
-				}
-				if (offset === undefined || (offset >= fullStart && offset <= fullEnd)) {
-					return { uri, start: fullStart, end: fullEnd };
-				}
-			}
-		}
-		return null;
+		return findBibleUriMatchInLineValue(line, offset);
 	}
 
 	private extractBibleUriFromText(input: string): string | null {
-		const trimmed = input.trim();
-		if (!trimmed) {
-			return null;
-		}
-		if (trimmed.toLowerCase().startsWith("bible:")) {
-			const bare = trimmed.match(/^(bible:(?:\/\/)?[^\s)\]]+)/i);
-			return bare ? bare[1].trim().replace(/[.,;!?]+$/, "") : null;
-		}
-		return this.findBibleUriMatchInLine(trimmed)?.uri ?? null;
+		return extractBibleUriFromTextValue(input);
 	}
 
 	private async findBibleCitationMatchInLine(
@@ -2329,6 +2809,9 @@ export default class BereanStandardBibleBrowser extends Plugin {
 		return false;
 	}
 
+	// Rendered markdown gets its own interception path because Obsidian may emit anchors with
+	// href/data-href outside CodeMirror. Keep this behavior aligned with the window-level click
+	// handler above or links will behave differently between reading mode and live preview.
 	private decorateBibleProtocolLinks(root: HTMLElement): void {
 		const links = root.querySelectorAll("a[href^='bible:'], a[data-href^='bible:']");
 		links.forEach((linkNode) => {
@@ -2387,6 +2870,7 @@ interface BibleStrongsState {
 
 class BibleReaderView extends FileView {
 	private reference: ParsedReference | null = null;
+	private renderVersion = 0;
 
 	constructor(leaf: WorkspaceLeaf, private readonly plugin: BereanStandardBibleBrowser) {
 		super(leaf);
@@ -2450,24 +2934,38 @@ class BibleReaderView extends FileView {
 	}
 
 	private async render(): Promise<void> {
+		const renderVersion = ++this.renderVersion;
+		const reference = this.reference;
 		this.contentEl.empty();
 		this.contentEl.addClass("bible-reader-view");
 
-		if (!this.reference) {
+		if (!reference) {
 			this.contentEl.createEl("p", { text: "Open a bible: link to read a chapter." });
 			return;
 		}
 
+		this.contentEl.createEl("p", { text: "Loading chapter..." });
+
 		try {
-			const chapterData = await this.plugin.getChapterByReference(this.reference);
-			const backlinks = await this.plugin.findChapterBacklinksPublic(this.reference);
+			const [chapterData, previousChapter, nextChapter] = await Promise.all([
+				this.plugin.getChapterByReference(reference),
+				this.plugin.getAdjacentChapterReferencePublic(reference, -1),
+				this.plugin.getAdjacentChapterReferencePublic(reference, 1),
+			]);
+			if (renderVersion !== this.renderVersion || this.reference !== reference) {
+				return;
+			}
+
+			this.contentEl.empty();
+			this.contentEl.addClass("bible-reader-view");
 			const heading = this.contentEl.createEl("h1", {
-				text: `${this.reference.bookName} ${this.reference.chapter}`,
+				text: `${reference.bookName} ${reference.chapter}`,
 			});
 			heading.style.marginBottom = "0.2rem";
 			this.contentEl.createEl("p", {
 				text: `Berean Standard Bible (${this.plugin.settings.translation.toUpperCase()})`,
 			});
+			this.renderChapterNavigation(this.contentEl, previousChapter, nextChapter);
 
 			const contentEl = this.contentEl.createDiv();
 			contentEl.style.maxWidth = "76ch";
@@ -2492,14 +2990,43 @@ class BibleReaderView extends FileView {
 				verse.appendText(this.plugin.renderVerseForReader(item.content));
 			}
 
+			this.renderChapterNavigation(this.contentEl, previousChapter, nextChapter);
+
 			const backlinksTitle = this.contentEl.createEl("h2", { text: "Backlinks" });
 			backlinksTitle.style.marginTop = "1.5rem";
-			if (backlinks.length === 0) {
-				this.contentEl.createEl("p", { text: "No backlinks found for this chapter yet." });
+			const backlinksContainer = this.contentEl.createDiv();
+			backlinksContainer.createEl("p", { text: "Loading backlinks..." });
+			void this.renderBacklinksSection(reference, backlinksContainer, renderVersion);
+		} catch (error) {
+			if (renderVersion !== this.renderVersion || this.reference !== reference) {
+				return;
+			}
+			this.contentEl.empty();
+			this.contentEl.addClass("bible-reader-view");
+			console.error("[BSB Browser] Reader render failed", error);
+			const message = error instanceof Error ? error.message : "Unknown error";
+			this.contentEl.createEl("p", { text: `Failed to load chapter: ${message}` });
+		}
+	}
+
+	private async renderBacklinksSection(
+		reference: ParsedReference,
+		container: HTMLElement,
+		renderVersion: number
+	): Promise<void> {
+		try {
+			const backlinks = await this.plugin.findChapterBacklinksPublic(reference);
+			if (renderVersion !== this.renderVersion || this.reference !== reference) {
 				return;
 			}
 
-			const list = this.contentEl.createEl("ul");
+			container.empty();
+			if (backlinks.length === 0) {
+				container.createEl("p", { text: "No backlinks found for this chapter yet." });
+				return;
+			}
+
+			const list = container.createEl("ul");
 			for (const file of backlinks.slice(0, 150)) {
 				const item = list.createEl("li");
 				const link = item.createEl("a", { href: "#", text: file.path });
@@ -2509,14 +3036,57 @@ class BibleReaderView extends FileView {
 				});
 			}
 		} catch (error) {
-			console.error("[BSB Browser] Reader render failed", error);
+			if (renderVersion !== this.renderVersion || this.reference !== reference) {
+				return;
+			}
+			container.empty();
 			const message = error instanceof Error ? error.message : "Unknown error";
-			this.contentEl.createEl("p", { text: `Failed to load chapter: ${message}` });
+			container.createEl("p", { text: `Failed to load backlinks: ${message}` });
 		}
+	}
+
+	private renderChapterNavigation(
+		parent: HTMLElement,
+		previousChapter: ParsedReference | null,
+		nextChapter: ParsedReference | null
+	): void {
+		if (!previousChapter && !nextChapter) {
+			return;
+		}
+
+		const nav = parent.createDiv({ cls: "bible-reader-nav" });
+		nav.style.display = "flex";
+		nav.style.justifyContent = "space-between";
+		nav.style.gap = "0.75rem";
+		nav.style.margin = "0.5rem 0 1rem";
+		nav.style.maxWidth = "76ch";
+
+		const previousContainer = nav.createDiv();
+		previousContainer.style.flex = "1";
+		if (previousChapter) {
+			this.renderChapterNavigationLink(previousContainer, "← Previous chapter", previousChapter);
+		}
+
+		const nextContainer = nav.createDiv();
+		nextContainer.style.flex = "1";
+		nextContainer.style.textAlign = "right";
+		if (nextChapter) {
+			this.renderChapterNavigationLink(nextContainer, "Next chapter →", nextChapter);
+		}
+	}
+
+	private renderChapterNavigationLink(parent: HTMLElement, label: string, reference: ParsedReference): void {
+		const link = parent.createEl("a", { href: "#", text: label });
+		link.addEventListener("click", (event) => {
+			event.preventDefault();
+			void this.plugin.openChapterForReferencePublic(reference);
+		});
 	}
 }
 
 class BibleBacklinksView extends ItemView {
+	private renderVersion = 0;
+
 	constructor(leaf: WorkspaceLeaf, private readonly plugin: BereanStandardBibleBrowser) {
 		super(leaf);
 	}
@@ -2538,6 +3108,7 @@ class BibleBacklinksView extends ItemView {
 	}
 
 	async refresh(): Promise<void> {
+		const renderVersion = ++this.renderVersion;
 		const { contentEl } = this;
 		contentEl.empty();
 
@@ -2550,20 +3121,40 @@ class BibleBacklinksView extends ItemView {
 		contentEl.createEl("h3", {
 			text: `Backlinks: ${this.plugin.formatReferencePublic(reference)}`,
 		});
-		const backlinks = await this.plugin.findChapterBacklinksPublic(reference);
-		if (backlinks.length === 0) {
-			contentEl.createEl("p", { text: "No backlinks found for this chapter yet." });
-			return;
-		}
-
-		const list = contentEl.createEl("ul");
-		for (const file of backlinks.slice(0, 300)) {
-			const item = list.createEl("li");
-			const link = item.createEl("a", { href: "#", text: file.path });
-			link.addEventListener("click", (event) => {
-				event.preventDefault();
-				void this.plugin.openFileInLeaf(file);
+		contentEl.createEl("p", { text: "Loading backlinks..." });
+		try {
+			const backlinks = await this.plugin.findChapterBacklinksPublic(reference);
+			if (renderVersion !== this.renderVersion || this.plugin.getActiveReaderReference() !== reference) {
+				return;
+			}
+			contentEl.empty();
+			contentEl.createEl("h3", {
+				text: `Backlinks: ${this.plugin.formatReferencePublic(reference)}`,
 			});
+			if (backlinks.length === 0) {
+				contentEl.createEl("p", { text: "No backlinks found for this chapter yet." });
+				return;
+			}
+
+			const list = contentEl.createEl("ul");
+			for (const file of backlinks.slice(0, 300)) {
+				const item = list.createEl("li");
+				const link = item.createEl("a", { href: "#", text: file.path });
+				link.addEventListener("click", (event) => {
+					event.preventDefault();
+					void this.plugin.openFileInLeaf(file);
+				});
+			}
+		} catch (error) {
+			if (renderVersion !== this.renderVersion || this.plugin.getActiveReaderReference() !== reference) {
+				return;
+			}
+			contentEl.empty();
+			contentEl.createEl("h3", {
+				text: `Backlinks: ${this.plugin.formatReferencePublic(reference)}`,
+			});
+			const message = error instanceof Error ? error.message : "Unknown error";
+			contentEl.createEl("p", { text: `Failed to load backlinks: ${message}` });
 		}
 	}
 }
@@ -2785,42 +3376,51 @@ class BibleSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("API base URL")
-			.setDesc("Source API used to load book and chapter text.")
+			.setDesc("Source API used to load book and chapter text. Applies on Enter or blur.")
 			.addText((text) =>
-				text
-					.setPlaceholder("https://bible.helloao.org/api")
-					.setValue(this.plugin.settings.apiBaseUrl)
-					.onChange(async (value) => {
-						this.plugin.settings.apiBaseUrl = value.trim() || DEFAULT_SETTINGS.apiBaseUrl;
+				this.bindCommittedTextSetting(
+					text.setPlaceholder("https://bible.helloao.org/api"),
+					this.plugin.settings.apiBaseUrl,
+					(value) => value.trim() || DEFAULT_SETTINGS.apiBaseUrl,
+					async (value) => {
+						this.plugin.settings.apiBaseUrl = value;
 						await this.plugin.saveSettings();
 						await this.plugin.resetProviderCaches();
-					})
+					}
+				)
 			);
 
-			if (ENABLE_STRONGS_SIDEBAR) {
-				new Setting(containerEl)
-					.setName("Strongs API base URL")
-					.setDesc("API base URL for Strong's concordance lookups.")
-					.addText((text) =>
-						text
-							.setPlaceholder("https://bible.helloao.org/api")
-							.setValue(this.plugin.settings.strongsApiBaseUrl)
-							.onChange(async (value) => {
-								this.plugin.settings.strongsApiBaseUrl = value.trim() || DEFAULT_SETTINGS.strongsApiBaseUrl;
-								await this.plugin.saveSettings();
-							})
-					);
-			}
+		if (ENABLE_STRONGS_SIDEBAR) {
+			new Setting(containerEl)
+				.setName("Strongs API base URL")
+				.setDesc("API base URL for Strong's concordance lookups. Applies on Enter or blur.")
+				.addText((text) =>
+					this.bindCommittedTextSetting(
+						text.setPlaceholder("https://api.biblesupersearch.com/api"),
+						this.plugin.settings.strongsApiBaseUrl,
+						(value) => value.trim() || DEFAULT_SETTINGS.strongsApiBaseUrl,
+						async (value) => {
+							this.plugin.settings.strongsApiBaseUrl = value;
+							await this.plugin.saveSettings();
+						}
+					)
+				);
+		}
 
 		new Setting(containerEl)
 			.setName("Translation code")
-			.setDesc("Default is BSB for Berean Standard Bible.")
+			.setDesc("Default is BSB for Berean Standard Bible. Applies on Enter or blur.")
 			.addText((text) =>
-				text.setPlaceholder("BSB").setValue(this.plugin.settings.translation).onChange(async (value) => {
-					this.plugin.settings.translation = (value.trim() || "BSB").toUpperCase();
-					await this.plugin.saveSettings();
-					await this.plugin.resetProviderCaches();
-				})
+				this.bindCommittedTextSetting(
+					text.setPlaceholder("BSB"),
+					this.plugin.settings.translation,
+					(value) => (value.trim() || "BSB").toUpperCase(),
+					async (value) => {
+						this.plugin.settings.translation = value;
+						await this.plugin.saveSettings();
+						await this.plugin.resetProviderCaches();
+					}
+				)
 			);
 
 		new Setting(containerEl)
@@ -2842,5 +3442,44 @@ class BibleSettingTab extends PluginSettingTab {
 					new Notice("Bible cache reset.");
 				})
 			);
+	}
+
+	private bindCommittedTextSetting(
+		text: TextComponent,
+		initialValue: string,
+		normalize: (value: string) => string,
+		onCommit: (value: string) => Promise<void>
+	): TextComponent {
+		let draftValue = initialValue;
+		let committedValue = initialValue;
+		let commitChain = Promise.resolve();
+
+		const commit = async (): Promise<void> => {
+			const nextValue = normalize(draftValue);
+			draftValue = nextValue;
+			text.setValue(nextValue);
+			if (nextValue === committedValue) {
+				return;
+			}
+
+			committedValue = nextValue;
+			commitChain = commitChain.then(() => onCommit(nextValue));
+			await commitChain;
+		};
+
+		text.setValue(initialValue).onChange((value) => {
+			draftValue = value;
+		});
+		text.inputEl.addEventListener("blur", () => {
+			void commit();
+		});
+		text.inputEl.addEventListener("keydown", (event: KeyboardEvent) => {
+			if (event.key !== "Enter") {
+				return;
+			}
+			event.preventDefault();
+			text.inputEl.blur();
+		});
+		return text;
 	}
 }

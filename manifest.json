@@ -3,7 +3,7 @@
   "name": "Berean Standard Bible Browser",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Browse the Berean Standard Bible in Obsidian with wiki-style bible: links and passage insertion.",
+  "description": "Browse the Berean Standard Bible in Obsidian with wiki-style bible: links, a chapter reader, and passage insertion.",
   "author": "Dabar",
   "isDesktopOnly": false
 }

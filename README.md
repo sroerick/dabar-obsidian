@@ -1,33 +1,54 @@
-# Berean Standard Bible Browser (Obsidian Plugin)
+# Berean Standard Bible Browser
 
-This plugin lets you browse the Berean Standard Bible (BSB) in Obsidian with wiki-style `bible:` links and native Obsidian graph/backlink behavior.
+Obsidian plugin for browsing the Berean Standard Bible with `bible:` links, a fileless chapter reader, backlink discovery, and passage insertion.
 
 ## Status
 
-- Super alpha: core workflows are usable, but API schema and UX details may still change.
-
-## Alpha Note
-
-- This plugin is in an early alpha state and may include breaking changes between commits.
-- Bible content currently depends on the configured API; local/offline Bible storage is not implemented yet.
-- Strong's sidebar/lookup is intentionally disabled for now while that feature is completed.
-- If you hit parsing or link-open issues, open an issue with the exact citation text and the command/action you used.
+- Alpha quality. Core workflows are usable, but APIs and UX details may still change.
+- Bible text is currently loaded from a configured remote API.
+- Local/offline Bible storage is not implemented yet.
+- Strong's lookup and quote insertion are available in the current alpha build and depend on a compatible Strong's API.
 
 ## Features
 
-- Open chapters from wiki Bible links like `[[bible:Genesis1|Genesis 1]]`.
-- Adds a left ribbon icon (`book-open`) that opens a Bible Browser page (books + chapters columns).
-- Insert formatted passage quotes from references like `Revelation 1:5-11`.
-- Convert plain citations like `Prov 15:23` into wiki Bible links (single cursor citation or multiple citations in a selected block).
-- Turn an existing Bible link at the cursor into a full quote block.
-- Autocomplete in reference dialogs (books/chapters/verses) with Arrow keys, `Tab`, and `Enter`.
-- Reader pane opens chapters in a full pane without creating any vault files.
-- Dedicated `Bible Backlinks` sidebar view follows the active reader chapter (fileless workflow).
-- Markdown-to-wiki migration commands for Bible links.
-- Legacy graph-section cleanup commands to remove old `BSB_GRAPH_LINKS` blocks.
-- API-backed today, with provider abstraction so local/offline storage can be added later.
+- Open chapters from Bible links such as `[[bible:Genesis1|Genesis 1]]`.
+- Insert Bible wiki links from a reference prompt.
+- Insert passage quotes from verse ranges such as `Revelation 1:5-11`.
+- Insert full chapter quotes from chapter references such as `Matthew 26`.
+- Look up Strong's entries such as `G3056` or `H7225` in a sidebar.
+- Insert Strong's quote blocks from Strong's codes.
+- Convert plain citations like `Prov 15:23` into wiki Bible links.
+- Convert existing Bible links at the cursor into quote blocks.
+- Convert legacy markdown/Bible protocol links across an active note or the whole vault.
+- Browse books and chapters in a dedicated Bible Browser view.
+- Open chapters in a dedicated reader pane without creating vault files.
+- Show backlinks for the active chapter in a dedicated sidebar view.
+- Remove legacy `BSB_GRAPH_LINKS` sections from notes.
 
-## Install (Development)
+## Commands
+
+- `Open Bible chapter from reference`
+- `Open Bible browser page`
+- `Open Bible backlinks sidebar`
+- `Lookup Strong's code`
+- `Insert Bible wiki link`
+- `Insert Bible passage or chapter quote`
+- `Insert Strong's quote`
+- `Convert Bible citation to wiki Bible link`
+- `Turn Bible link at cursor into quote`
+- `Convert Bible links to wiki in active note`
+- `Convert Bible links to wiki in entire vault`
+- `Remove legacy BSB graph section in active note`
+- `Remove legacy BSB graph section in entire vault`
+
+## Supported Link Formats
+
+- Preferred canonical form: `[[bible:Genesis1|Genesis 1]]`
+- Also accepted for opening/conversion: `[Genesis 1](bible:Genesis1)`, `bible://Genesis%201`, `bible:Deuteronomy25`
+- Bare protocol references like `bible:Exodus12:11` can be converted to canonical wiki links
+- Parser examples: `1 corinthians 13`, `1Corinthians13`, `Genesis1:1`
+
+## Development Install
 
 1. Run:
 
@@ -40,44 +61,33 @@ npm run build
 
 - `manifest.json`
 - `main.js`
-- `styles.css` (not used yet)
+- `styles.css`
 
 3. Enable the plugin in Obsidian Community Plugins.
 
-## Release Checks
+## Verification
 
-Run this before publishing code or cutting an alpha build:
+Local verification:
 
 ```bash
-npm ci
 npm run ci
 ```
 
-## Commands
+CI runs on pushes and pull requests via [`.github/workflows/ci.yml`](/home/roerick/dev/obsidian/dabar-obsidian/.github/workflows/ci.yml).
 
-- `Open Bible chapter from reference`
-- `Open Bible browser page`
-- `Open Bible backlinks sidebar`
-- `Insert Bible wiki link`
-- `Insert Bible passage quote`
-- `Convert Bible citation to wiki Bible link`
-- `Turn Bible link at cursor into quote`
-- `Convert Markdown Bible links to wiki in active note`
-- `Convert Markdown Bible links to wiki in entire vault`
-- `Remove legacy BSB graph section in active note`
-- `Remove legacy BSB graph section in entire vault`
+Review checklist:
 
-## Link Formats
+- See [RELEASE_CHECKLIST.md](/home/roerick/dev/obsidian/dabar-obsidian/RELEASE_CHECKLIST.md)
 
-- Preferred: `[[bible:Genesis1|Genesis 1]]`
-- Also accepted by parser/opening: `[Genesis 1](bible:Genesis1)`, `bible://Genesis%201`, `bible:Deuteronomy25`
-- Passage references: `Revelation 1:5-11`
-- Parser examples: `1 corinthians 13`, `1Corinthians13`, `Genesis1:1`
-
-## Notes
+## Configuration
 
 - Default API endpoint: `https://bible.helloao.org/api`
-- Strong's sidebar is currently disabled in alpha while that feature is being finalized.
+- Default Strong's API endpoint: `https://api.biblesupersearch.com/api`
 - Default translation: `BSB`
-- The plugin no longer creates Bible chapter files in your vault.
-- Manifest and package versions are currently `0.1.0`.
+- Footnote markers can be included in rendered verses and inserted passages
+- The plugin does not create Bible chapter files in your vault
+
+## Versioning
+
+- Manifest version: `0.1.0`
+- Package version: `0.1.0`

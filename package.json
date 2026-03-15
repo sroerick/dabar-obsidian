@@ -1,13 +1,14 @@
 {
   "name": "dabar-obsidian",
   "version": "0.1.0",
-  "description": "Obsidian plugin for browsing the Berean Standard Bible.",
+  "description": "Browse the Berean Standard Bible in Obsidian with wiki-style bible: links, a chapter reader, and passage insertion.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs --production",
     "check": "tsc --noEmit --skipLibCheck",
-    "ci": "npm run check && npm run build"
+    "test": "rm -rf .test-dist && tsc -p tsconfig.test.json && node --test .test-dist/test/**/*.test.js",
+    "ci": "npm run check && npm run test && npm run build"
   },
   "keywords": [
     "obsidian",
@@ -15,7 +16,7 @@
     "bible",
     "berean-standard-bible"
   ],
-  "author": "",
+  "author": "Dabar",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.17.30",
